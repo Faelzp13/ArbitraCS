@@ -2,7 +2,7 @@ name: Skin Insight Pipeline
 
 on:
   schedule:
-    - cron: '0 */3 * * *' # Executa automaticamente a cada 3 horas
+    - cron: '0 */1 * * *' # Executa automaticamente a cada 1 horas
   workflow_dispatch: # Permite disparo manual na interface do GitHub
 
 jobs:
