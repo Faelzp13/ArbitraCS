@@ -7,3 +7,4 @@ adlfs
 pyarrow
 pyodbc
 SQLAlchemy
+psycopg2-binary

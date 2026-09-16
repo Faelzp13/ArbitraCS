@@ -1,15 +1,23 @@
 import os
 import io
 import logging
-import urllib.parse
 import pandas as pd
 import time
 from sqlalchemy import create_engine, text
 from azure.storage.blob import BlobServiceClient
 from sqlalchemy.exc import SQLAlchemyError
+from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+script_dir = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.abspath(os.path.join(script_dir, "..", "..", "frontend", ".env.local"))
+
+if os.path.exists(env_path):
+    logging.info(f"Carregando .env local em: {env_path}")
+    load_dotenv(env_path)
+else:
+    logging.info("Arquivo .env.local não encontrado localmente. Utilizando variáveis de ambiente do sistema/GitHub Secrets.")
 
 def get_latest_silver_parquet(conn_str):
     """Encontra e faz o download do arquivo Parquet mais recente da camada Silver."""
@@ -20,57 +28,56 @@ def get_latest_silver_parquet(conn_str):
     if not blobs:
         raise FileNotFoundError("Nenhum arquivo parquet encontrado em silver/facts/")
 
-    # Ordena para pegar o arquivo criado mais recentemente
     latest_blob = sorted(blobs, key=lambda b: b.creation_time, reverse=True)[0]
     logging.info(f"Lendo o arquivo mais recente: {latest_blob.name}")
 
     blob_client = container_client.get_blob_client(latest_blob.name)
     download_stream = blob_client.download_blob()
 
-    # Lê os dados em binário direto da memória para o Pandas
     return pd.read_parquet(io.BytesIO(download_stream.readall()))
 
 
 def main():
     azure_conn_str = os.getenv("AZURE_CONNECTION_STRING")
-    sql_conn_str = os.getenv("AZURE_SQL_CONNECTION_STRING")
+    # Lendo a mesma variável que o Next.js usa
+    sql_conn_str = os.getenv("DATABASE_URL")
 
     if not azure_conn_str or not sql_conn_str:
-        logging.error("Variáveis de ambiente (Connection Strings) ausentes.")
+        logging.error("Variáveis de ambiente (Connection Strings) ausentes. Verifique seu .env")
         return
+
+    # Adaptador Inteligente: O Next.js usa 'postgresql://', mas o Python precisa do 'psycopg2'
+    if sql_conn_str.startswith("postgresql://"):
+        sql_conn_str = sql_conn_str.replace("postgresql://", "postgresql+psycopg2://")
 
     # 1. Puxar os dados processados do Data Lake
     df = get_latest_silver_parquet(azure_conn_str)
 
-    # 2. Conectar ao Azure SQL Database usando SQLAlchemy
-    params = urllib.parse.quote_plus(sql_conn_str)
+    # 2. Conectar ao PostgreSQL (Supabase)
     engine = create_engine(
-        f"mssql+pyodbc:///?odbc_connect={params}",
-        fast_executemany=True,
-        connect_args={'timeout': 90}
+        sql_conn_str,
+        # fast_executemany é do SQL Server, no Postgres não precisamos disso
+        connect_args={'connect_timeout': 90}
     )
 
-    # --- PING DE AQUECIMENTO (Lida com o Cold Start do Azure) ---
-    logging.info("Enviando ping para acordar o Azure SQL...")
+    # --- PING DE CONEXÃO ---
+    logging.info("Testando conexão com o Supabase...")
     for attempt in range(3):
         try:
             with engine.connect() as test_conn:
                 test_conn.execute(text("SELECT 1"))
-            logging.info("Banco de dados acordado e pronto para receber dados!")
-            break  # Sai do loop se der certo
-        except SQLAlchemyError:
-            logging.warning(f"Banco pausado. Aguardando 30 segundos (Tentativa {attempt + 1}/3)...")
-            time.sleep(30)
+            logging.info("Conexão com PostgreSQL estabelecida com sucesso!")
+            break
+        except SQLAlchemyError as e:
+            logging.warning(f"Falha na conexão. Aguardando 10 segundos (Tentativa {attempt + 1}/3)... Erro: {e}")
+            time.sleep(10)
     else:
-        raise Exception("O banco de dados não acordou após 3 tentativas.")
-    # -------------------------------------------------------------
+        raise Exception("Não foi possível conectar ao banco após 3 tentativas.")
 
-    # 3. Preparar e Atualizar Dimensões (Evitando erros de chaves duplicadas)
     # 3. Preparar Dimensões
     dim_skins = df[['tradeup_id', 'skin']].drop_duplicates().rename(columns={'skin': 'skin_name'})
     dim_markets = df[['market']].drop_duplicates().rename(columns={'market': 'market_name'})
 
-    # engine.begin() já cria a transação segura e faz o commit automático no final
     with engine.begin() as conn:
         # Atualiza dim_markets
         existing_markets = pd.read_sql("SELECT market_name FROM dim_markets", conn)
@@ -89,51 +96,51 @@ def main():
         # 4. Preparar e Atualizar Fatos
         fact_df = df[['tradeup_id', 'wear', 'market', 'price', 'timestamp']].copy()
         fact_df.rename(columns={'market': 'market_name', 'timestamp': 'extraction_timestamp'}, inplace=True)
-        fact_df['extraction_timestamp'] = pd.to_datetime(fact_df['extraction_timestamp']).dt.strftime(
-            '%Y-%m-%d %H:%M:%S')
 
         logging.info("Limpando preços antigos no banco de dados com TRUNCATE...")
         conn.execute(text("TRUNCATE TABLE fact_current_prices"))
 
         logging.info("Inserindo os preços atuais atualizados...")
-        # Note que agora usamos 'conn' ao invés de 'engine', evitando o Deadlock!
-        fact_df.to_sql('fact_current_prices', conn, if_exists='append', index=False, chunksize=2000)
+        # Note que a coluna 'extraction_timestamp' foi removida nas novas tabelas do Postgres
+        # Portanto, não enviamos ela no to_sql para evitar erro de coluna inexistente
+        current_prices_df = fact_df[['tradeup_id', 'wear', 'market_name', 'price']]
+        current_prices_df.to_sql('fact_current_prices', conn, if_exists='append', index=False, chunksize=2000)
+
         logging.info("Iniciando roteamento de snapshots de histórico...")
 
         current_time = pd.Timestamp.now()
         current_date_str = current_time.strftime('%Y-%m-%d')
 
-        # Prepara o DataFrame apenas com as colunas essenciais para o histórico
-        history_df = fact_df[['tradeup_id', 'wear', 'market_name', 'price']].copy()
+        history_df = fact_df[['tradeup_id', 'wear', 'price']].copy()
         history_df['date_id'] = current_date_str
 
-        # 1. SNAPSHOT DIÁRIO (Todo dia | Retenção: 30 dias)
+        # 1. SNAPSHOT DIÁRIO (Retenção: 30 dias)
         conn.execute(text(f"DELETE FROM fact_history_daily WHERE date_id = '{current_date_str}'"))
         history_df.to_sql('fact_history_daily', conn, if_exists='append', index=False, chunksize=2000)
-        conn.execute(text("DELETE FROM fact_history_daily WHERE date_id < CAST(GETDATE() - 30 AS DATE)"))
+        conn.execute(text("DELETE FROM fact_history_daily WHERE date_id < CURRENT_DATE - INTERVAL '30 days'"))
 
-        # 2. SNAPSHOT SEMANAL (Apenas aos Domingos | Retenção: 365 dias)
+        # 2. SNAPSHOT SEMANAL (Domingos | Retenção: 365 dias)
         if current_time.dayofweek == 6:  # No Pandas, 6 = Domingo
             logging.info("Domingo detectado: Atualizando snapshot semanal...")
             conn.execute(text(f"DELETE FROM fact_history_weekly WHERE date_id = '{current_date_str}'"))
             history_df.to_sql('fact_history_weekly', conn, if_exists='append', index=False, chunksize=2000)
-            conn.execute(text("DELETE FROM fact_history_weekly WHERE date_id < CAST(GETDATE() - 365 AS DATE)"))
+            conn.execute(text("DELETE FROM fact_history_weekly WHERE date_id < CURRENT_DATE - INTERVAL '365 days'"))
 
-        # 3. SNAPSHOT MENSAL (Apenas no dia 1º do mês | Retenção: 5 anos / 1825 dias)
+        # 3. SNAPSHOT MENSAL (Dia 1º | Retenção: 5 anos)
         if current_time.day == 1:
             logging.info("Dia 1º detectado: Atualizando snapshot mensal...")
             conn.execute(text(f"DELETE FROM fact_history_monthly WHERE date_id = '{current_date_str}'"))
             history_df.to_sql('fact_history_monthly', conn, if_exists='append', index=False, chunksize=2000)
-            conn.execute(text("DELETE FROM fact_history_monthly WHERE date_id < CAST(GETDATE() - 1825 AS DATE)"))
+            conn.execute(text("DELETE FROM fact_history_monthly WHERE date_id < CURRENT_DATE - INTERVAL '5 years'"))
 
-        # 4. SNAPSHOT ANUAL (Apenas 1º de Janeiro | Retenção: 10 anos / 3650 dias)
+        # 4. SNAPSHOT ANUAL (1º de Janeiro | Retenção: 10 anos)
         if current_time.day == 1 and current_time.month == 1:
             logging.info("1º de Janeiro detectado: Atualizando snapshot anual...")
             conn.execute(text(f"DELETE FROM fact_history_yearly WHERE date_id = '{current_date_str}'"))
             history_df.to_sql('fact_history_yearly', conn, if_exists='append', index=False, chunksize=2000)
-            conn.execute(text("DELETE FROM fact_history_yearly WHERE date_id < CAST(GETDATE() - 3650 AS DATE)"))
+            conn.execute(text("DELETE FROM fact_history_yearly WHERE date_id < CURRENT_DATE - INTERVAL '10 years'"))
 
-    logging.info("Carga da Camada Gold concluída com sucesso!")
+    logging.info("Carga da Camada Gold (Supabase) concluída com sucesso!")
 
 
 if __name__ == "__main__":
