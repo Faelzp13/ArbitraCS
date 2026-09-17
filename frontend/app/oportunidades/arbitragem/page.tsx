@@ -18,7 +18,7 @@ export default async function ArbitragemPage({
   const maxDiscount = parseFloat((params.maxDiscount as string) || '70');
   const category = (params.category as string) || 'normal';
 
-  const pool = await getConnection();
+  const pool = getConnection();
   const { rate, symbol } = await getCurrencyInfo();
 
   let categoryFilter = "";
@@ -30,14 +30,7 @@ export default async function ArbitragemPage({
     categoryFilter = "AND (c.wear LIKE 'Sv %' OR c.wear LIKE 'Souvenir %')";
   }
 
-  // NOVA QUERY: Compara Preço Atual de Terceiros x Preço Atual da Steam
-  // E faz o JOIN com a dim_markets para puxar a logo_url
-  const result = await pool.request()
-    .input('minPrice', minPrice)
-    .input('maxPrice', maxPrice)
-    .input('minDiscount', minDiscount)
-    .input('maxDiscount', maxDiscount)
-    .query(`
+  const result = await pool.query(`
     WITH CurrentSteam AS (
       SELECT tradeup_id, wear, price AS steam_price
       FROM fact_current_prices
@@ -58,32 +51,37 @@ export default async function ArbitragemPage({
         ((s.steam_price - c.tp_price) / s.steam_price) * 100 AS discount_pct,
         ROW_NUMBER() OVER(PARTITION BY c.tradeup_id, c.wear ORDER BY c.tp_price ASC) as rn
       FROM CurrentTP c
-      JOIN CurrentSteam s ON c.tradeup_id = s.tradeup_id AND c.wear = s.wear
-      WHERE s.steam_price >= @minPrice 
-        AND s.steam_price <= @maxPrice
+      JOIN CurrentSteam s 
+        ON c.tradeup_id::text = s.tradeup_id::text 
+        AND c.wear::text = s.wear::text
+      WHERE s.steam_price >= $1 
+        AND s.steam_price <= $2
         AND c.tp_price > 0 
         ${categoryFilter}
     )
-    SELECT TOP 50
+    SELECT 
       r.tradeup_id,
       d.skin_name,
       d.image_url,
       r.wear,
       r.tp_market AS market_name,
-      m.logo_url, -- Puxando a logo diretamente do banco
-      r.tp_price AS price,
-      r.steam_price,
-      r.discount_pct
+      m.logo_url, 
+      r.tp_price::float AS price,
+      r.steam_price::float AS steam_price,
+      r.discount_pct::float AS discount_pct
     FROM RankedDeals r
-    JOIN dim_skins d ON r.tradeup_id = d.tradeup_id
-    LEFT JOIN dim_markets m ON r.tp_market = m.market_name -- Cruzamento para buscar a logo
+    JOIN dim_skins d 
+      ON r.tradeup_id::text = d.tradeup_id::text
+    LEFT JOIN dim_markets m 
+      ON r.tp_market::text = m.market_name::text
     WHERE r.rn = 1 
-      AND r.discount_pct >= @minDiscount 
-      AND r.discount_pct <= @maxDiscount
+      AND r.discount_pct >= $3 
+      AND r.discount_pct <= $4
     ORDER BY r.discount_pct DESC
-  `);
+    LIMIT 50
+  `, [minPrice, maxPrice, minDiscount, maxDiscount]);
 
-  const skins = result.recordset;
+  const skins = result.rows;
 
   return (
     <main className="min-h-screen bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-50 p-6 md:p-10 font-sans transition-colors">

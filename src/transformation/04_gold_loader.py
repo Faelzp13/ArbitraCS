@@ -111,7 +111,7 @@ def main():
         current_time = pd.Timestamp.now()
         current_date_str = current_time.strftime('%Y-%m-%d')
 
-        history_df = fact_df[['tradeup_id', 'wear', 'price']].copy()
+        history_df = fact_df[['tradeup_id', 'wear', 'market_name', 'price']].copy()
         history_df['date_id'] = current_date_str
 
         # 1. SNAPSHOT DIÁRIO (Retenção: 30 dias)

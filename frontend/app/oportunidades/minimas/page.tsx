@@ -27,15 +27,11 @@ export default async function MinimasPage({
     categoryFilter = "AND (c.wear LIKE 'Sv %' OR c.wear LIKE 'Souvenir %')";
   }
 
-  // QUERY: Adicionado o LEFT JOIN com dim_markets para puxar a logo_url
-  const result = await pool.request()
-    .input('minPrice', minPrice)
-    .input('maxPrice', maxPrice)
-    .query(`
+  const result = await pool.query(`
     WITH HistoryStats AS (
       SELECT tradeup_id, wear, MIN(price) as min_price_30d, AVG(price) as avg_price_30d
       FROM fact_history_daily
-      WHERE date_id >= CAST(DATEADD(day, -30, GETDATE()) AS DATE)
+      WHERE date_id >= (CURRENT_DATE - INTERVAL '30 days')::date
       GROUP BY tradeup_id, wear
     ),
     CurrentPrices AS (
@@ -53,32 +49,35 @@ export default async function MinimasPage({
         ((h.avg_price_30d - c.price) / h.avg_price_30d) * 100 AS drop_pct,
         ROW_NUMBER() OVER(PARTITION BY c.tradeup_id, c.wear ORDER BY c.price ASC) as rn
       FROM CurrentPrices c
-      JOIN HistoryStats h ON c.tradeup_id = h.tradeup_id AND c.wear = h.wear
+      JOIN HistoryStats h 
+        ON c.tradeup_id::text = h.tradeup_id::text 
+        AND c.wear::text = h.wear::text
       WHERE c.price > 0 
         AND c.price <= h.min_price_30d 
-        AND h.avg_price_30d >= @minPrice 
-        AND h.avg_price_30d <= @maxPrice
+        AND h.avg_price_30d >= $1 
+        AND h.avg_price_30d <= $2
         ${categoryFilter}
     )
-    SELECT TOP 50
+    SELECT 
       r.tradeup_id,
       d.skin_name,
       d.image_url,
       r.wear,
       r.market_name,
-      m.logo_url, -- Puxando a logo do mercado
-      r.price,
-      r.min_price_30d,
-      r.avg_price_30d,
-      r.drop_pct
+      m.logo_url,
+      r.price::float AS price,
+      r.min_price_30d::float AS min_price_30d,
+      r.avg_price_30d::float AS avg_price_30d,
+      r.drop_pct::float AS drop_pct
     FROM RankedLows r
-    JOIN dim_skins d ON r.tradeup_id = d.tradeup_id
-    LEFT JOIN dim_markets m ON r.market_name = m.market_name -- Cruzamento para buscar a imagem
+    JOIN dim_skins d ON r.tradeup_id::text = d.tradeup_id::text
+    LEFT JOIN dim_markets m ON r.market_name::text = m.market_name::text
     WHERE r.rn = 1 
     ORDER BY r.drop_pct DESC
-  `);
+    LIMIT 50
+  `, [minPrice, maxPrice]);
 
-  const skins = result.recordset;
+  const skins = result.rows;
 
   return (
     <main className="min-h-screen bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-50 p-6 md:p-10 font-sans transition-colors">

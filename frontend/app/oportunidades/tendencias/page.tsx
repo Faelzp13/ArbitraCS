@@ -31,20 +31,12 @@ export default async function TendenciasPage({
     categoryFilter = "AND (c.wear LIKE 'Sv %' OR c.wear LIKE 'Souvenir %')";
   }
 
-  // NOVA QUERY: Compara Preço ATUAL vs Média Histórica (até 30 dias).
-  // Multiplicar por 100.0 garante que o SQL Server faça a divisão com casas decimais.
-  const result = await pool.request()
-    .input('minPrice', minPrice)
-    .input('maxPrice', maxPrice)
-    .input('minGrowth', minGrowth)
-    .input('offset', offset)
-    .input('pageSize', pageSize)
-    .query(`
+  const result = await pool.query(`
     WITH HistoryStats AS (
       SELECT tradeup_id, wear, AVG(price) as avg_history
       FROM fact_history_daily
       WHERE market_name LIKE '%Steam%'
-        AND date_id >= CAST(DATEADD(day, -30, GETDATE()) AS DATE)
+        AND date_id >= (CURRENT_DATE - INTERVAL '30 days')::date
       GROUP BY tradeup_id, wear
     ),
     CurrentSteam AS (
@@ -60,10 +52,12 @@ export default async function TendenciasPage({
         h.avg_history,
         ((c.current_price - h.avg_history) / h.avg_history) * 100.0 AS growth_pct
       FROM CurrentSteam c
-      JOIN HistoryStats h ON c.tradeup_id = h.tradeup_id AND c.wear = h.wear
+      JOIN HistoryStats h 
+        ON c.tradeup_id::text = h.tradeup_id::text 
+        AND c.wear::text = h.wear::text
       WHERE h.avg_history > 0 
-        AND c.current_price >= @minPrice 
-        AND c.current_price <= @maxPrice
+        AND c.current_price >= $1 
+        AND c.current_price <= $2
         ${categoryFilter}
     )
     SELECT 
@@ -71,18 +65,18 @@ export default async function TendenciasPage({
       d.skin_name,
       d.image_url,
       t.wear,
-      t.current_price AS avg_current,
-      t.avg_history AS avg_previous,
-      t.growth_pct,
-      COUNT(*) OVER() AS total_items 
+      t.current_price::float AS avg_current,
+      t.avg_history::float AS avg_previous,
+      t.growth_pct::float AS growth_pct,
+      (COUNT(*) OVER())::int AS total_items 
     FROM Trends t
-    JOIN dim_skins d ON t.tradeup_id = d.tradeup_id
-    WHERE t.growth_pct >= @minGrowth
+    JOIN dim_skins d ON t.tradeup_id::text = d.tradeup_id::text
+    WHERE t.growth_pct >= $3
     ORDER BY t.growth_pct DESC
-    OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
-  `);
+    LIMIT $5 OFFSET $4 
+  `, [minPrice, maxPrice, minGrowth, offset, pageSize]); // $1, $2, $3, $4, $5
 
-  const skins = result.recordset;
+  const skins = result.rows;
   const totalItems = skins.length > 0 ? skins[0].total_items : 0;
   const totalPages = Math.ceil(totalItems / pageSize);
 
