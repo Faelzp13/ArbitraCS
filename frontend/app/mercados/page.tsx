@@ -4,19 +4,18 @@ import MarketTooltip from "../components/MarketTooltip";
 export default async function MercadosPage() {
   const pool = await getConnection();
 
-  // Puxa os mercados que estão no banco (adicionei o market_id para o React não reclamar do key)
-  const result = await pool.request().query(`
+  const result = await pool.query(`
     SELECT 
-  CASE 
-    WHEN market_name = 'market_37' THEN 'Skin.Land' 
-    ELSE market_name 
-  END AS market_name,
-  logo_url
+      CASE 
+        WHEN market_name = 'market_37' THEN 'Skin.Land' 
+        ELSE market_name 
+      END AS market_name,
+      logo_url
     FROM dim_markets
     ORDER BY market_name ASC
   `);
 
-  const mercados = result.recordset;
+  const mercados = result.rows;
 
   return (
     <main className="min-h-screen bg-neutral-50 dark:bg-neutral-950 p-6 md:p-12 transition-colors">
@@ -30,7 +29,7 @@ export default async function MercadosPage() {
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
           {mercados.map((mercado) => (
-            <div key={mercado.market_id} className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-xl p-6 flex flex-col items-center justify-center shadow-md hover:shadow-lg transition-shadow">
+            <div key={mercado.market_name} className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-xl p-6 flex flex-col items-center justify-center shadow-md hover:shadow-lg transition-shadow">
 
               {mercado.logo_url ? (
                 <MarketTooltip marketName={mercado.market_name}>

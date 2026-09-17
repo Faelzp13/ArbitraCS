@@ -12,44 +12,49 @@ export default async function SkinPage({ params }: { params: Promise<{ id: strin
 
   const pool = await getConnection();
 
-  const batchQuery = `
-    SELECT skin_name, image_url FROM dim_skins WHERE tradeup_id = @id;
-    
-    SELECT 
-      CASE 
-        WHEN market_name = 'market_37' THEN 'Skin.Land' 
-        ELSE market_name 
-      END AS market_name, 
-      wear, 
-      price 
-    FROM fact_current_prices 
-    WHERE tradeup_id = @id;
-    
-    -- A sua correção na dim_markets (perfeita)
-    SELECT 
-      CASE 
-        WHEN market_name = 'market_37' THEN 'Skin.Land' 
-        ELSE market_name 
-      END AS market_name, 
-      logo_url AS image_url 
-    FROM dim_markets;
-    
-    -- Busca o histórico diário agrupando a média de todos os mercados
-    SELECT date_id, wear, AVG(price) as avg_price 
-    FROM fact_history_daily 
-    WHERE tradeup_id = @id 
-    GROUP BY date_id, wear 
-    ORDER BY date_id ASC;
-  `;
+  // Executamos as 4 queries simultaneamente no PostgreSQL para máximo desempenho
+  const [skinRes, pricesRes, marketsRes, historyRes] = await Promise.all([
+    pool.query(`
+      SELECT skin_name, image_url 
+      FROM dim_skins 
+      WHERE tradeup_id = $1
+    `, [id]),
 
-  const dbResult = await pool.request()
-    .input('id', id)
-    .query(batchQuery);
+    pool.query(`
+      SELECT 
+        CASE 
+          WHEN market_name = 'market_37' THEN 'Skin.Land' 
+          ELSE market_name 
+        END AS market_name, 
+        wear, 
+        price::float AS price 
+      FROM fact_current_prices 
+      WHERE tradeup_id = $1
+    `, [id]),
 
-  const skin = dbResult.recordsets[0][0];
-  const prices = dbResult.recordsets[1];
-  const marketsRaw = dbResult.recordsets[2];
-  const historyRaw = dbResult.recordsets[3];
+    pool.query(`
+      SELECT 
+        CASE 
+          WHEN market_name = 'market_37' THEN 'Skin.Land' 
+          ELSE market_name 
+        END AS market_name, 
+        logo_url AS image_url 
+      FROM dim_markets
+    `),
+
+    pool.query(`
+      SELECT date_id, wear, AVG(price)::float as avg_price 
+      FROM fact_history_daily 
+      WHERE tradeup_id = $1 
+      GROUP BY date_id, wear 
+      ORDER BY date_id ASC
+    `, [id])
+  ]);
+
+  const skin = skinRes.rows[0];
+  const prices = pricesRes.rows;
+  const marketsRaw = marketsRes.rows;
+  const historyRaw = historyRes.rows;
 
   const marketsInfo = marketsRaw.reduce((acc, curr) => {
     acc[curr.market_name] = curr.image_url;
